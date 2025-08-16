@@ -7,21 +7,29 @@ from sklearn.metrics import accuracy_score
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 import evaluate
+import argparse
+import os
+import logging
 
 
 class CNN(nn.Module):
-    def __init__(self, num_classes, max_len, hidden_dim, vocab_size):
+    def __init__(self, num_classes, max_len, hidden_dim, vocab_size, num_layers=2):
         super().__init__()
         self.max_len = max_len
         self.num_classes = num_classes       
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
+        self.num_layers = num_layers
 
-        # Need 3 bytes of receptieve field, because apparently bytes are 3 bytes long in utf-8 if not emojis (ignored)
-        # TODO: Filter out emojis
+        # First conv layer: vocab_size -> hidden_dim
         self.conv1 = nn.Conv1d(self.vocab_size, self.hidden_dim, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=2)
-        self.conv3 = nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=2)
+        
+        # Intermediate conv layers
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=2)
+            for _ in range(num_layers)
+        ])
+        
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.classifier = nn.Linear(self.hidden_dim, num_classes)
         
@@ -32,11 +40,15 @@ class CNN(nn.Module):
         x_onehot = x_onehot.float().transpose(1, 2)  # [batch, 256, seq_len]
         
         x = F.relu(self.conv1(x_onehot))
-        x = F.relu(self.conv2(x))
+        
+        # Apply intermediate conv layers
+        for conv in self.conv_layers:
+            x = F.relu(conv(x))
+        
         x = self.pool(x).squeeze(-1)
         return self.classifier(x)
 
-def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, metric):
+def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, metric, logger):
     model.train()
     total_loss = 0
     
@@ -58,7 +70,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, 
         writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
         
         if batch_idx % 100 == 0:
-            print(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
+            logger.info(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
     
     results = metric.compute()
     accuracy = results['accuracy']
@@ -79,7 +91,7 @@ def byte_level_tokenize(batch, max_length=128):
     return {'input_ids': padded_texts, 'label': batch['label']}
 
 
-def evaluate(model, dataloader, criterion, device, metric):
+def eval(model, dataloader, criterion, device, metric):
     model.eval()
     total_loss = 0
     
@@ -98,62 +110,82 @@ def evaluate(model, dataloader, criterion, device, metric):
     return total_loss / len(dataloader), accuracy
 
 def main():
+    parser = argparse.ArgumentParser(description='Language Classification Training')
+    parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension size')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of intermediary CNN layers')
+    parser.add_argument('--run_name', type=str, default='language_classification', help='Name of the training run')
+    parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training and evaluation')
+    args = parser.parse_args()
+    
+    # Create run directory
+    run_dir = f'runs/{args.run_name}'
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Setup logging to file
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(run_dir, 'training.log')),
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
+    logger.info(f'Using device: {device}')
+    logger.info(f'Run name: {args.run_name}')
+    logger.info(f'Hidden dim: {args.hidden_dim}, Num layers: {args.num_layers}')
+    logger.info(f'Epochs: {args.num_epochs}, Batch size: {args.batch_size}')
     
     # Initialize TensorBoard writer
-    writer = SummaryWriter('runs/language_classification')
+    writer = SummaryWriter(run_dir)
     
-    print("Loading dataset...")
+    logger.info("Loading dataset...")
     ds = load_dataset("MartinThoma/wili_2018")
     
-    print("Tokenizing to bytes...")
+    logger.info("Tokenizing to bytes...")
     tokenized_ds = ds.map(byte_level_tokenize, batched=True, batch_size=1000)
     
     all_labels = list(ds['train']['label']) + list(ds['test']['label'])
     num_classes = max(all_labels) + 1
-    print(f"Number of languages: {num_classes}")
+    logger.info(f"Number of languages: {num_classes}")
     
     vocab_size = 257
-    print(f"Vocabulary size: {vocab_size}")
+    logger.info(f"Vocabulary size: {vocab_size}")
     
     tokenized_ds.set_format(type='torch', columns=['input_ids', 'label'])
     
-    batch_size = 32
-    train_loader = DataLoader(tokenized_ds['train'], batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(tokenized_ds['test'], batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(tokenized_ds['train'], batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(tokenized_ds['test'], batch_size=args.batch_size, shuffle=False)
     
     # Initialize model
     model = CNN(
-            hidden_dim=32,
+            hidden_dim=args.hidden_dim,
             num_classes=num_classes,
             max_len=128,
             vocab_size=vocab_size,
+            num_layers=args.num_layers,
     ).to(device)
     
-    print(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters.")
-    
-    # Log model parameters count to TensorBoard
-    writer.add_scalar('Model/Parameters', sum(p.numel() for p in model.parameters()), 0)
+    logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters.")
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
     
     # Load accuracy metric once
-    accuracy_metric = evaluate.load("accuracy")
+    accuracy_metric = evaluate.load('accuracy')
     
     # Training loop
-    num_epochs = 10
     best_test_acc = 0
     
-    print("Starting training...")
-    for epoch in range(num_epochs):
-        print(f'\nEpoch {epoch + 1}/{num_epochs}')
-        print('-' * 50)
+    logger.info("Starting training...")
+    for epoch in range(args.num_epochs):
+        logger.info(f'Epoch {epoch + 1}/{args.num_epochs}')
         
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch, accuracy_metric)
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device, accuracy_metric)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch, accuracy_metric, logger)
+        test_loss, test_acc = eval(model, test_loader, criterion, device, accuracy_metric)
         
         # Log epoch metrics to TensorBoard
         writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
@@ -164,8 +196,8 @@ def main():
         # Log learning rate
         writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         
-        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}')
-        print(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}')
+        logger.info(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}')
+        logger.info(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}')
         
         # Save best model
         if test_acc > best_test_acc:
@@ -174,13 +206,14 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
                 'test_accuracy': test_acc,
-            }, 'best_model.pth')
-            print(f'New best model saved with accuracy: {best_test_acc:.4f}')
+                'args': vars(args),
+            }, os.path.join(run_dir, 'best_model.pth'))
+            logger.info(f'New best model saved with accuracy: {best_test_acc:.4f}')
     
     writer.close()
-    print(f'\nTraining completed! Best test accuracy: {best_test_acc:.4f}')
-    print(f'TensorBoard logs saved to: runs/language_classification')
-    print('Run "tensorboard --logdir=runs" to view logs')
+    logger.info(f'Training completed! Best test accuracy: {best_test_acc:.4f}')
+    logger.info(f'TensorBoard logs saved to: {run_dir}')
+    logger.info('Run "tensorboard --logdir=runs" to view logs')
 
 if __name__ == "__main__":
     main()
