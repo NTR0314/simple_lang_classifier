@@ -10,6 +10,7 @@ import evaluate
 import argparse
 import os
 import logging
+from torch.optim.lr_scheduler import LambdaLR
 
 
 class CNN(nn.Module):
@@ -48,7 +49,8 @@ class CNN(nn.Module):
         x = self.pool(x).squeeze(-1)
         return self.classifier(x)
 
-def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, metric, logger):
+
+def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, writer, epoch, metric, logger):
     model.train()
     total_loss = 0
     
@@ -60,6 +62,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, 
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
         total_loss += loss.item()
         predictions = torch.argmax(output, dim=-1)
@@ -109,6 +112,26 @@ def eval(model, dataloader, criterion, device, metric):
     accuracy = results['accuracy']
     return total_loss / len(dataloader), accuracy
 
+
+def collate_fn(batch, min_length):
+    input_ids, labels = [], []
+
+    for item in batch:
+        x = item["input_ids"]
+        y = item["label"]
+
+        start = torch.randint(min_length, len(x) + 1, (1,)).item()
+        x[start:] = 0  # 0 is the padding token
+
+        input_ids.append(x)
+        labels.append(y)
+
+    return {
+        "input_ids": torch.stack(input_ids),
+        "label": torch.tensor(labels)
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Language Classification Training')
     parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension size')
@@ -116,6 +139,8 @@ def main():
     parser.add_argument('--run_name', type=str, default='language_classification', help='Name of the training run')
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training and evaluation')
+    parser.add_argument('--start_lr', type=float, default=1e-3, help='Initial learning rate')
+    parser.add_argument('--target_lr', type=float, default=1e-5, help='Final learning rate after decay')
     args = parser.parse_args()
     
     # Create run directory
@@ -156,7 +181,7 @@ def main():
     
     tokenized_ds.set_format(type='torch', columns=['input_ids', 'label'])
     
-    train_loader = DataLoader(tokenized_ds['train'], batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(tokenized_ds['train'], batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, min_length=20))
     test_loader = DataLoader(tokenized_ds['test'], batch_size=args.batch_size, shuffle=False)
     
     # Initialize model
@@ -172,7 +197,14 @@ def main():
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=args.start_lr, weight_decay=0.01)
+    
+    def lr_lambda(updates, start_lr, target_lr):
+        percentage_remaining = 1 - (updates / (args.num_epochs * len(train_loader)))
+        factor = target_lr / start_lr
+        return factor + percentage_remaining * ( 1 - factor)
+    
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda updates: lr_lambda(updates, args.start_lr, args.target_lr))
     
     # Load accuracy metric once
     accuracy_metric = evaluate.load('accuracy')
@@ -184,7 +216,7 @@ def main():
     for epoch in range(args.num_epochs):
         logger.info(f'Epoch {epoch + 1}/{args.num_epochs}')
         
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch, accuracy_metric, logger)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, writer, epoch, accuracy_metric, logger)
         test_loss, test_acc = eval(model, test_loader, criterion, device, accuracy_metric)
         
         # Log epoch metrics to TensorBoard
