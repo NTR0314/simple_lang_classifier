@@ -6,6 +6,7 @@ from datasets import load_dataset
 from sklearn.metrics import accuracy_score
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
+import evaluate
 
 
 class CNN(nn.Module):
@@ -35,11 +36,9 @@ class CNN(nn.Module):
         x = self.pool(x).squeeze(-1)
         return self.classifier(x)
 
-def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch):
+def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch, metric):
     model.train()
     total_loss = 0
-    predictions = []
-    targets = []
     
     for batch_idx, batch in enumerate(dataloader):
         data, target = batch['input_ids'].to(device), batch['label'].to(device)
@@ -51,9 +50,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch):
         optimizer.step()
         
         total_loss += loss.item()
-        pred = output.argmax(dim=1)
-        predictions.extend(pred.cpu().numpy())
-        targets.extend(target.cpu().numpy())
+        predictions = torch.argmax(output, dim=-1)
+        metric.add_batch(predictions=predictions.cpu(), references=target.cpu())
         
         # Log batch loss to TensorBoard
         global_step = epoch * len(dataloader) + batch_idx
@@ -62,7 +60,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch):
         if batch_idx % 100 == 0:
             print(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
     
-    accuracy = accuracy_score(targets, predictions)
+    results = metric.compute()
+    accuracy = results['accuracy']
     return total_loss / len(dataloader), accuracy
 
 
@@ -80,11 +79,9 @@ def byte_level_tokenize(batch, max_length=128):
     return {'input_ids': padded_texts, 'label': batch['label']}
 
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, metric):
     model.eval()
     total_loss = 0
-    predictions = []
-    targets = []
     
     with torch.no_grad():
         for batch in dataloader:
@@ -93,11 +90,11 @@ def evaluate(model, dataloader, criterion, device):
             loss = criterion(output, target)
             
             total_loss += loss.item()
-            pred = output.argmax(dim=1)
-            predictions.extend(pred.cpu().numpy())
-            targets.extend(target.cpu().numpy())
+            predictions = torch.argmax(output, dim=-1)
+            metric.add_batch(predictions=predictions.cpu(), references=target.cpu())
     
-    accuracy = accuracy_score(targets, predictions)
+    results = metric.compute()
+    accuracy = results['accuracy']
     return total_loss / len(dataloader), accuracy
 
 def main():
@@ -141,7 +138,10 @@ def main():
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    
+    # Load accuracy metric once
+    accuracy_metric = evaluate.load("accuracy")
     
     # Training loop
     num_epochs = 10
@@ -152,8 +152,8 @@ def main():
         print(f'\nEpoch {epoch + 1}/{num_epochs}')
         print('-' * 50)
         
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch)
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch, accuracy_metric)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device, accuracy_metric)
         
         # Log epoch metrics to TensorBoard
         writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
