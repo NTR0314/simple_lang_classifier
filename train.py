@@ -50,6 +50,43 @@ class CNN(nn.Module):
         return self.classifier(x)
 
 
+class CNNRNN(nn.Module):
+    def __init__(self, num_classes, max_len, hidden_dim, vocab_size, num_layers=1):
+        super().__init__()
+        self.max_len = max_len
+        self.num_classes = num_classes       
+        self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
+        self.num_layers = num_layers
+
+        # First conv layer: vocab_size -> hidden_dim
+        self.conv1 = nn.Conv1d(self.vocab_size, self.hidden_dim, kernel_size=3, padding=1)
+        
+        # GRU layer
+        self.gru = nn.GRU(self.hidden_dim, self.hidden_dim, num_layers=self.num_layers, batch_first=True)
+        
+        self.classifier = nn.Linear(self.hidden_dim, num_classes)
+        
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        x_onehot = F.one_hot(x, num_classes=self.vocab_size)
+        x_onehot = x_onehot.float().transpose(1, 2)  # [batch, 256, seq_len]
+        
+        x = F.relu(self.conv1(x_onehot))
+        
+        # gru expects (batch, seq_len, features)
+        x = x.transpose(1, 2)
+        
+        # Pass through GRU
+        _, h_n = self.gru(x)
+        
+        # Get the last hidden state
+        x = h_n[-1, :, :]
+        
+        return self.classifier(x)
+
+
 def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, writer, epoch, metric, logger):
     model.train()
     total_loss = 0
@@ -141,6 +178,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training and evaluation')
     parser.add_argument('--start_lr', type=float, default=1e-3, help='Initial learning rate')
     parser.add_argument('--target_lr', type=float, default=1e-5, help='Final learning rate after decay')
+    parser.add_argument('--model', type=str, default='CNN', choices=['CNN', 'CNNRNN'], help='Model to use')
     args = parser.parse_args()
     
     # Create run directory
@@ -185,13 +223,22 @@ def main():
     test_loader = DataLoader(tokenized_ds['test'], batch_size=args.batch_size, shuffle=False)
     
     # Initialize model
-    model = CNN(
-            hidden_dim=args.hidden_dim,
-            num_classes=num_classes,
-            max_len=128,
-            vocab_size=vocab_size,
-            num_layers=args.num_layers,
-    ).to(device)
+    if args.model == 'CNN':
+        model = CNN(
+                hidden_dim=args.hidden_dim,
+                num_classes=num_classes,
+                max_len=128,
+                vocab_size=vocab_size,
+                num_layers=args.num_layers,
+        ).to(device)
+    elif args.model == 'CNNRNN':
+        model = CNNRNN(
+                hidden_dim=args.hidden_dim,
+                num_classes=num_classes,
+                max_len=128,
+                vocab_size=vocab_size,
+                num_layers=args.num_layers,
+        ).to(device)
     
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters.")
     
