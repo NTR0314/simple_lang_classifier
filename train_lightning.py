@@ -31,15 +31,15 @@ class CNN(nn.Module):
         self.num_layers = num_layers
 
         # First conv layer: vocab_size -> hidden_dim
-        self.conv1 = nn.Conv1d(self.vocab_size, self.hidden_dim, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv1d(self.vocab_size, self.hidden_dim, kernel_size=3, padding=3 // 2)
         
         # Intermediate conv layers
         self.conv_layers = nn.ModuleList([
-            nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=2)
+            nn.Conv1d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=2, padding=3 // 2)
             for _ in range(num_layers)
         ])
         
-        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.pool = nn.MaxPool1d(self.max_len // (2 ** num_layers))
         self.classifier = nn.Linear(self.hidden_dim, num_classes)
         
     def forward(self, x):
