@@ -1,4 +1,3 @@
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -240,12 +239,17 @@ class LanguageDataModule(pl.LightningDataModule):
         self.min_length = min_length
         self.wili_langs = None
         self.lang_to_label = None
+        self.setup_done = False
         
     def prepare_data(self):
         # Download datasets (this is called only on one GPU in distributed setting)
         load_dataset("MartinThoma/wili_2018")
     
     def setup(self, stage=None):
+        if self.setup_done:
+            return
+        self.setup_done = True
+
         # Load datasets
         ds = load_dataset("MartinThoma/wili_2018")
         
