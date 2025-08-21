@@ -11,6 +11,9 @@ import argparse
 import os
 import logging
 from torch.optim.lr_scheduler import LambdaLR
+from tatoebatools import tatoeba
+from pathlib import Path
+import pickle
 
 
 class CNN(nn.Module):
@@ -168,7 +171,6 @@ def collate_fn(batch, min_length):
         "label": torch.tensor(labels)
     }
 
-
 def main():
     parser = argparse.ArgumentParser(description='Language Classification Training')
     parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension size')
@@ -204,11 +206,24 @@ def main():
     # Initialize TensorBoard writer
     writer = SummaryWriter(run_dir)
     
-    logger.info("Loading dataset...")
+    logger.info("Loading wili_2018 dataset...")
     ds = load_dataset("MartinThoma/wili_2018")
     
+    logger.info("Getting languages from wili_2018...")
+    wili_langs = ds['train'].features['label'].names
+    lang_to_label = {lang: i for i, lang in enumerate(wili_langs)}
+    
+    tatoeba_sentences, tatoeba_labels = get_cached_tatoeba_data(logger, wili_langs=wili_langs, lang_to_label=lang_to_label)
+
+    from datasets import Dataset, concatenate_datasets
+    tatoeba_ds = Dataset.from_dict({"sentence": tatoeba_sentences, "label": tatoeba_labels}, features=ds['train'].features)
+    
+    logger.info("Combining datasets...")
+    train_ds = concatenate_datasets([ds['train'], tatoeba_ds]).shuffle(seed=42)
+
     logger.info("Tokenizing to bytes...")
-    tokenized_ds = ds.map(byte_level_tokenize, batched=True, batch_size=1000)
+    tokenized_train_ds = train_ds.map(byte_level_tokenize, batched=True, batch_size=1000)
+    tokenized_test_ds = ds['test'].map(byte_level_tokenize, batched=True, batch_size=1000)
     
     all_labels = list(ds['train']['label']) + list(ds['test']['label'])
     num_classes = max(all_labels) + 1
@@ -217,10 +232,11 @@ def main():
     vocab_size = 257
     logger.info(f"Vocabulary size: {vocab_size}")
     
-    tokenized_ds.set_format(type='torch', columns=['input_ids', 'label'])
+    tokenized_train_ds.set_format(type='torch', columns=['input_ids', 'label'])
+    tokenized_test_ds.set_format(type='torch', columns=['input_ids', 'label'])
     
-    train_loader = DataLoader(tokenized_ds['train'], batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, min_length=20))
-    test_loader = DataLoader(tokenized_ds['test'], batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(tokenized_train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, min_length=20))
+    test_loader = DataLoader(tokenized_test_ds, batch_size=args.batch_size, shuffle=False)
     
     # Initialize model
     if args.model == 'CNN':
@@ -293,6 +309,55 @@ def main():
     logger.info(f'Training completed! Best test accuracy: {best_test_acc:.4f}')
     logger.info(f'TensorBoard logs saved to: {run_dir}')
     logger.info('Run "tensorboard --logdir=runs" to view logs')
+    
+
+def get_cached_tatoeba_data(logger, wili_langs, lang_to_label, cache_dir="cache"):
+    tatoeba_langs = tatoeba.all_languages
+    common_langs = set(wili_langs) & set(tatoeba_langs)
+    logger.info(f"Found {len(common_langs)} common languages.")
+
+    cache_path = Path(cache_dir) / "tatoeba_processed.pkl"
+
+    if cache_path.exists():
+        logger.info("Loading cached processed tatoeba data...")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    tatoeba_sentences = []
+    tatoeba_labels = []
+    
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    import multiprocessing as mp
+
+    _ = list(tatoeba.sentences_detailed(common_langs.pop()))[:1]
+
+    def process_language(lang):
+        """Process a single language and return sentences and labels"""
+        logger.info(f"Processing {lang}...")
+        sentences = [s.text for s in tatoeba.sentences_detailed(lang)]
+        labels = [lang_to_label[lang]] * len(sentences)
+        return sentences, labels
+
+    # Use ThreadPoolExecutor if I/O bound, ProcessPoolExecutor if CPU bound
+    # with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
+    #     results = list(executor.map(process_language, common_langs))
+    
+    results = []
+    for lang in common_langs:
+        results.append(process_language(lang))
+
+    for sentences, labels in results:
+        tatoeba_sentences.extend(sentences)
+        tatoeba_labels.extend(labels)
+
+    # Cache the processed data
+    cache_path.parent.mkdir(exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump((tatoeba_sentences, tatoeba_labels), f)
+
+    return tatoeba_sentences, tatoeba_labels
+
 
 if __name__ == "__main__":
     main()
+    
