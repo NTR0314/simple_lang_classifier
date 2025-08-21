@@ -368,11 +368,15 @@ def main():
 def get_cached_tatoeba_data(logger, wili_langs, lang_to_label, sample_rate=0.1):
     cache_dir = Path("cache")
     cache_dir.mkdir(exist_ok=True)
+
+    tatoeba_langs = tatoeba.all_languages
+    common_langs = set(wili_langs) & set(tatoeba_langs)
+    logger.info(f"Found {len(common_langs)} common languages.")
     
     tatoeba_sentences = []
     tatoeba_labels = []
     
-    for lang in wili_langs:
+    for lang in common_langs:
         cache_path = cache_dir / f"tatoeba_{lang}_sampled_{sample_rate}.pkl"
         
         if cache_path.exists():
