@@ -1,9 +1,10 @@
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 import evaluate
@@ -14,6 +15,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from tatoebatools import tatoeba
 from pathlib import Path
 import pickle
+import numpy as np
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
+import torchvision.transforms as transforms
+from tqdm import tqdm
 
 
 class CNN(nn.Module):
@@ -94,27 +101,32 @@ def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, writ
     model.train()
     total_loss = 0
     
-    for batch_idx, batch in enumerate(dataloader):
-        data, target = batch['input_ids'].to(device), batch['label'].to(device)
-        
-        optimizer.zero_grad()
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        
-        total_loss += loss.item()
-        predictions = torch.argmax(output, dim=-1)
-        metric.add_batch(predictions=predictions.cpu(), references=target.cpu())
-        
-        # Log batch loss to TensorBoard
-        global_step = epoch * len(dataloader) + batch_idx
-        writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-        
-        if batch_idx % 100 == 0:
-            logger.info(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
-    
+    num_samples = len(dataloader.dataset)
+    with tqdm(total=num_samples, desc=f"Epoch {epoch+1} Training", unit="sentence") as progress_bar:
+        for batch_idx, batch in enumerate(dataloader):
+            data, target = batch['input_ids'].to(device), batch['label'].to(device)
+            
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+            predictions = torch.argmax(output, dim=-1)
+            metric.add_batch(predictions=predictions.cpu(), references=target.cpu())
+            
+            # Log batch loss to TensorBoard
+            global_step = epoch * len(dataloader) + batch_idx
+            writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+            
+            if batch_idx % 100 == 0:
+                logger.info(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
+            
+            progress_bar.update(data.shape[0])
+            progress_bar.set_postfix(loss=loss.item())
+
     results = metric.compute()
     accuracy = results['accuracy']
     return total_loss / len(dataloader), accuracy
@@ -134,9 +146,11 @@ def byte_level_tokenize(batch, max_length=128):
     return {'input_ids': padded_texts, 'label': batch['label']}
 
 
-def eval(model, dataloader, criterion, device, metric):
+def eval(model, dataloader, criterion, device, metric, writer, epoch, wili_langs):
     model.eval()
     total_loss = 0
+    y_pred = []
+    y_true = []
     
     with torch.no_grad():
         for batch in dataloader:
@@ -147,9 +161,49 @@ def eval(model, dataloader, criterion, device, metric):
             total_loss += loss.item()
             predictions = torch.argmax(output, dim=-1)
             metric.add_batch(predictions=predictions.cpu(), references=target.cpu())
-    
+            y_pred.extend(predictions.cpu().tolist())
+            y_true.extend(target.cpu().tolist())
+
     results = metric.compute()
     accuracy = results['accuracy']
+
+    # Create confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    fig = plt.figure(figsize=(20, 20))
+    ax = fig.add_subplot(1, 1, 1)
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    
+    ax.set(xticks=np.arange(cm.shape[1]),
+            yticks=np.arange(cm.shape[0]),
+            xticklabels=wili_langs, yticklabels=wili_langs,
+            title='Confusion Matrix',
+            ylabel='True label',
+            xlabel='Predicted label')
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right",
+                rotation_mode="anchor")
+
+    # Loop over data dimensions and create text annotations.
+    fmt = 'd'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    
+    # Convert plot to image
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = Image.open(buf)
+    image_tensor = transforms.ToTensor()(image)
+    
+    writer.add_image('Confusion Matrix', image_tensor, epoch)
+    plt.close(fig)
+
     return total_loss / len(dataloader), accuracy
 
 
@@ -280,7 +334,7 @@ def main():
         logger.info(f'Epoch {epoch + 1}/{args.num_epochs}')
         
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, writer, epoch, accuracy_metric, logger)
-        test_loss, test_acc = eval(model, test_loader, criterion, device, accuracy_metric)
+        test_loss, test_acc = eval(model, test_loader, criterion, device, accuracy_metric, writer, epoch, wili_langs)
         
         # Log epoch metrics to TensorBoard
         writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
@@ -311,52 +365,39 @@ def main():
     logger.info('Run "tensorboard --logdir=runs" to view logs')
     
 
-def get_cached_tatoeba_data(logger, wili_langs, lang_to_label, cache_dir="cache"):
-    tatoeba_langs = tatoeba.all_languages
-    common_langs = set(wili_langs) & set(tatoeba_langs)
-    logger.info(f"Found {len(common_langs)} common languages.")
-
-    cache_path = Path(cache_dir) / "tatoeba_processed.pkl"
-
-    if cache_path.exists():
-        logger.info("Loading cached processed tatoeba data...")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
+def get_cached_tatoeba_data(logger, wili_langs, lang_to_label, sample_rate=0.1):
+    cache_dir = Path("cache")
+    cache_dir.mkdir(exist_ok=True)
+    
     tatoeba_sentences = []
     tatoeba_labels = []
     
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-    import multiprocessing as mp
-
-    _ = list(tatoeba.sentences_detailed(common_langs.pop()))[:1]
-
-    def process_language(lang):
-        """Process a single language and return sentences and labels"""
-        logger.info(f"Processing {lang}...")
-        sentences = [s.text for s in tatoeba.sentences_detailed(lang)]
-        labels = [lang_to_label[lang]] * len(sentences)
-        return sentences, labels
-
-    # Use ThreadPoolExecutor if I/O bound, ProcessPoolExecutor if CPU bound
-    # with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
-    #     results = list(executor.map(process_language, common_langs))
-    
-    results = []
-    for lang in common_langs:
-        results.append(process_language(lang))
-
-    for sentences, labels in results:
+    for lang in wili_langs:
+        cache_path = cache_dir / f"tatoeba_{lang}_sampled_{sample_rate}.pkl"
+        
+        if cache_path.exists():
+            logger.info(f"Loading cached sampled data for {lang}...")
+            with open(cache_path, "rb") as f:
+                sentences, labels = pickle.load(f)
+        else:
+            logger.info(f"Fetching sentences for {lang} from tatoeba...")
+            all_sentences = [s.text for s in tatoeba.sentences_detailed(lang)]
+            
+            num_samples = int(len(all_sentences) * sample_rate)
+            sampled_sentences = random.sample(all_sentences, min(num_samples, len(all_sentences)))
+            sentences = sampled_sentences
+            labels = [lang_to_label[lang]] * len(sentences)
+            
+            logger.info(f"Sampled {len(sentences)} out of {len(all_sentences)} sentences for {lang}")
+            
+            # Cache the sampled data
+            with open(cache_path, "wb") as f:
+                pickle.dump((sentences, labels), f)
+        
         tatoeba_sentences.extend(sentences)
         tatoeba_labels.extend(labels)
-
-    # Cache the processed data
-    cache_path.parent.mkdir(exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump((tatoeba_sentences, tatoeba_labels), f)
-
+    
     return tatoeba_sentences, tatoeba_labels
-
 
 if __name__ == "__main__":
     main()
