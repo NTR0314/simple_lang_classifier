@@ -1,0 +1,21 @@
+[project]
+name = "ukp-language-id"
+version = "0.1.0"
+description = "UKP Language Identification Project"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "torch",
+    "transformers",
+    "pytorch-lightning",
+    "datasets",
+    "evaluate",
+    "scikit-learn",
+    "pandas",
+    "numpy",
+    "PyPDF2",
+    "huggingface-hub",
+]
+
