@@ -17,5 +17,9 @@ dependencies = [
     "numpy",
     "PyPDF2",
     "huggingface-hub",
+    "tensorboard",
+    "matplotlib",
+    "torchvision",
+    "python-multipart",
 ]
 
